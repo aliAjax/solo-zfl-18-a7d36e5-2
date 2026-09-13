@@ -388,8 +388,10 @@ function factionName(id) {
 }
 
 // ---------- 赛果合法性 ----------
-export function validateResults(seats, tableCount) {
+// requireResults=true（已结算/结算/更正）：分数与名次必填；false（草稿/发布态）只校验已填的值与座位结构。
+export function validateResults(seats, tableCount, { requireResults = true } = {}) {
   const errors = [];
+  const label = (t) => `第${t + 1}桌`;
   const byTable = new Map();
   for (const s of seats) {
     if (!byTable.has(s.tableNo)) byTable.set(s.tableNo, []);
@@ -397,32 +399,63 @@ export function validateResults(seats, tableCount) {
   }
   for (let t = 0; t < tableCount; t++) {
     const list = byTable.get(t) || [];
+    if (!list.length) {
+      if (requireResults) errors.push({ tableNo: t, msg: `${label(t)}没有座位记录` });
+      continue;
+    }
+
+    // 同桌同座号重复
+    const pos = new Map();
     for (const s of list) {
-      const name = s.playerId;
-      if (s.score === null || s.score === undefined || s.score === "") {
-        errors.push({ tableNo: t, playerId: s.playerId, msg: `第${t + 1}桌有玩家未填比分` });
+      const key = s.seatNo;
+      if (pos.has(key)) {
+        errors.push({ tableNo: t, msg: `${label(t)} ${s.seatNo} 号座被两名玩家重复占用` });
+      } else {
+        pos.set(key, s);
+      }
+    }
+
+    for (const s of list) {
+      const who = ""; // 调用方拿不到玩家名，由 UI/导入层补充上下文
+      const missingScore = s.score === null || s.score === undefined || s.score === "";
+      const missingRank = s.rank === null || s.rank === undefined || s.rank === "";
+      if (missingScore || missingRank) {
+        if (requireResults) {
+          errors.push({ tableNo: t, playerId: s.playerId, msg: `${label(t)}有玩家未填${missingScore ? "比分" : ""}${missingScore && missingRank ? "和" : ""}${missingRank ? "名次" : ""}` });
+        }
         continue;
       }
-      if (!Number.isInteger(s.score) || s.score < 0) errors.push({ tableNo: t, playerId: s.playerId, msg: `第${t + 1}桌比分非法（需非负整数）` });
-      if (!Number.isInteger(s.rank) || s.rank < 1) errors.push({ tableNo: t, playerId: s.playerId, msg: `第${t + 1}桌名次非法（需 ≥1 的整数，并列允许）` });
+      if (!Number.isInteger(s.score) || s.score < 0) {
+        errors.push({ tableNo: t, playerId: s.playerId, msg: `${label(t)}比分 ${s.score} 非法（需非负整数）` });
+      }
+      if (!Number.isInteger(s.rank) || s.rank < 1) {
+        errors.push({ tableNo: t, playerId: s.playerId, msg: `${label(t)}名次 ${s.rank} 非法（需 ≥1 的整数，并列允许）` });
+      }
     }
-    const ranks = list.map((s) => s.rank).filter((r) => Number.isInteger(r)).sort((a, b) => a - b);
+
+    const ranks = list.map((s) => s.rank).filter(Number.isInteger).sort((a, b) => a - b);
     if (ranks.length === list.length && ranks.length) {
-      if (ranks[0] !== 1) errors.push({ tableNo: t, msg: `第${t + 1}桌名次必须从 1 开始` });
-      let seen = 0;
+      if (ranks[0] !== 1) errors.push({ tableNo: t, msg: `${label(t)}名次必须从 1 开始` });
+      // 标准竞赛排名：排好序后，第 i 个名次不得超过 i+1（并列后顺延，禁止断档）
       for (let i = 0; i < ranks.length; i++) {
-        if (i > 0 && ranks[i] > seen + 1) {
-          errors.push({ tableNo: t, msg: `第${t + 1}桌名次 ${ranks[i]} 出现断档（并列后应顺延）` });
+        if (ranks[i] > i + 1) {
+          errors.push({ tableNo: t, msg: `${label(t)}名次出现断档（${ranks.join(", ")}），并列后名次应顺延` });
           break;
-        }
-        seen++;
-        if (i === ranks.length - 1 || ranks[i + 1] !== ranks[i]) {
-          // 该名次组结束，seen 已推进
         }
       }
     }
   }
   return errors;
+}
+
+/** 校验某轮当前座位的赛果（已结算轮强制结果齐全） */
+export function validateRoundResults(state, roundId, { requireResults } = {}) {
+  const round = state.rounds.find((r) => r.id === roundId);
+  if (!round) return [{ msg: "轮次不存在" }];
+  const seats = state.seats.filter((s) => s.roundId === roundId && s.attendance !== "absent");
+  const tableCount = Math.max(0, ...state.seats.filter((s) => s.roundId === roundId).map((s) => s.tableNo)) + 1;
+  const requireNow = requireResults ?? round.status === ROUND_STATUS.SETTLED;
+  return validateResults(seats, tableCount, { requireResults: requireNow });
 }
 
 // ---------- 单桌名次给分 ----------
@@ -611,25 +644,38 @@ export function validateImport(doc) {
     seatsByRound.get(s.roundId).push(s);
   }
   for (const [rid, list] of seatsByRound) {
+    const round = doc.rounds.find((r) => r.id === rid);
     const seen = new Set();
+    const positions = new Set();
     for (const s of list) {
       const key = s.originalPlayerId || s.playerId;
       if (seen.has(key)) {
-        const round = doc.rounds.find((r) => r.id === rid);
         fail("DUPLICATE_ENTRY", `第 ${round?.name || rid} 轮中玩家 ${s.playerId} 重复参赛`);
       }
       seen.add(key);
+      // 同桌同座号重复（缺席占位也占座号）
+      const posKey = `${s.tableNo}:${s.seatNo}`;
+      if (positions.has(posKey)) {
+        fail("DUPLICATE_SEAT", `第 ${round?.name || rid} 轮第 ${s.tableNo + 1} 桌 ${s.seatNo} 号座被两名玩家重复占用`);
+      }
+      positions.add(posKey);
+      if (!Number.isInteger(s.tableNo) || s.tableNo < 0 || !Number.isInteger(s.seatNo) || s.seatNo < 1) {
+        fail("BAD_SCORE", `第 ${round?.name || rid} 轮座位 ${s.id} 的桌号/座号非法`);
+      }
     }
   }
 
-  // 非法比分
-  for (const s of doc.seats) {
-    if (s.attendance === "absent") continue;
-    if (s.score !== null && s.score !== undefined) {
-      if (!Number.isInteger(s.score) || s.score < 0) fail("BAD_SCORE", `座位 ${s.id} 比分非法：${s.score}`);
-    }
-    if (s.rank !== null && s.rank !== undefined) {
-      if (!Number.isInteger(s.rank) || s.rank < 1) fail("BAD_SCORE", `座位 ${s.id} 名次非法：${s.rank}`);
+  // 赛果：已结算轮必须结果齐全且无断档；已发布/草稿轮只校验已填值与结构。
+  for (const round of doc.rounds) {
+    const list = seatsByRound.get(round.id) || [];
+    const active = list.filter((s) => s.attendance !== "absent");
+    const tableCount = list.reduce((m, s) => Math.max(m, (s.tableNo || 0) + 1), 0);
+    const resultErrors = validateResults(active, tableCount, {
+      requireResults: round.status === ROUND_STATUS.SETTLED
+    });
+    for (const e of resultErrors) {
+      const code = /未填/.test(e.msg) ? "MISSING_RESULT" : /重复占用/.test(e.msg) ? "DUPLICATE_SEAT" : "BAD_SCORE";
+      fail(code, `${round.name}：${e.msg}`);
     }
   }
 

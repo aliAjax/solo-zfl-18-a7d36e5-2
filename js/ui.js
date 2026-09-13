@@ -590,7 +590,10 @@ document.body.addEventListener("focusout", (e) => {
     ? { score: intOrNull(e.target.value) }
     : { rank: intOrNull(e.target.value) };
   const result = A.correctSeatResult(e.target.dataset.seat, patch, before);
-  if (result?.ok === false) toast(result.errors.join("；"), "err");
+  if (result?.ok === false) {
+    toast(`更正被拒绝，已恢复原值：${result.errors.join("；")}`, "err");
+    render(); // 整轮已回滚，刷新所有输入框为真实值
+  }
 });
 
 document.body.addEventListener("change", (e) => {

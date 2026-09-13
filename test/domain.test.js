@@ -3,6 +3,7 @@ import {
   seatRound,
   computeStandings,
   validateImport,
+  validateResults,
   planSizes,
   ROUND_STATUS
 } from "../js/domain.js";
@@ -221,6 +222,27 @@ assert(Math.max(idx.p2, idx.p3) === 2 && Math.min(idx.p2, idx.p3) === 1, `p2/p3 
 assert(Math.max(idx.p4, idx.p5) === 4 && Math.min(idx.p4, idx.p5) === 3, `p4/p5 对手分 3 应占 4-5 位：${JSON.stringify(idx)}`);
 assert(idx.p2 < idx.p5, "p2 与 p5 同总分且直接交手 p2 胜，p2 应在 p5 前");
 
+// ---- 赛果校验：缺失 / 非法值 / 断档 / 重复座号 ----
+const seat = (t, n, pid, rank, score) => ({ tableNo: t, seatNo: n, playerId: pid, rank, score });
+let errs = validateResults([seat(0, 1, "a", 1, 10), seat(0, 2, "b", 2, 8), seat(0, 3, "c", 2, 8)], 1);
+assert(errs.length === 0, `并列第二(1,2,2)合法: ${JSON.stringify(errs)}`);
+errs = validateResults([seat(0, 1, "a", 1, 10), seat(0, 2, "b", 1, 10), seat(0, 3, "c", 3, 7)], 1);
+assert(errs.length === 0, `并列第一(1,1,3)合法: ${JSON.stringify(errs)}`);
+errs = validateResults([seat(0, 1, "a", 1, 10), seat(0, 2, "b", 3, 8), seat(0, 3, "c", 3, 7)], 1);
+assert(errs.some((e) => e.msg.includes("断档")), "名次 1,3,3 断档被检出");
+errs = validateResults([seat(0, 1, "a", 0, 10), seat(0, 2, "b", 1, 8)], 1);
+assert(errs.some((e) => /名次 0 非法|名次必须从 1/.test(e.msg)), "零名次被检出");
+errs = validateResults([seat(0, 1, "a", 1, -5), seat(0, 2, "b", 2, 8)], 1);
+assert(errs.some((e) => e.msg.includes("比分 -5")), "负比分被检出");
+errs = validateResults([seat(0, 1, "a", null, 10), seat(0, 2, "b", 1, 8)], 1, { requireResults: true });
+assert(errs.some((e) => e.msg.includes("未填")), "已结算但缺名次被检出");
+errs = validateResults([seat(0, 1, "a", 1, null), seat(0, 2, "b", 2, 8)], 1, { requireResults: true });
+assert(errs.some((e) => e.msg.includes("未填")), "已结算但缺比分被检出");
+errs = validateResults([seat(0, 1, "a", null, null), seat(0, 2, "b", 1, 8)], 1, { requireResults: false });
+assert(errs.length === 0, `非结算态允许空结果: ${JSON.stringify(errs)}`);
+errs = validateResults([seat(0, 1, "a", 1, 9), seat(0, 1, "b", 2, 8)], 1);
+assert(errs.some((e) => e.msg.includes("重复占用")), "同桌同座号重复被检出");
+
 // ---- 导入校验 ----
 const baseDoc = () => ({
   schema: "league-console/v1",
@@ -252,6 +274,29 @@ const badScore = baseDoc();
 badScore.seats[0] = { ...badScore.seats[0], score: -3 };
 rep = validateImport(badScore);
 assert(rep.errors.some((e) => e.code === "BAD_SCORE"), "非法比分被检出");
+
+const missingResult = baseDoc();
+missingResult.seats[0] = { ...missingResult.seats[0], rank: null, score: null };
+rep = validateImport(missingResult);
+assert(rep.errors.some((e) => e.code === "MISSING_RESULT"), "已结算轮缺失比分/名次被检出");
+
+const zeroRank = baseDoc();
+zeroRank.seats[0] = { ...zeroRank.seats[0], rank: 0 };
+rep = validateImport(zeroRank);
+assert(rep.errors.some((e) => e.code === "BAD_SCORE"), "导入文件零名次被检出");
+
+const dupSeat = baseDoc();
+dupSeat.factions.push({ id: "f2", name: "B" });
+dupSeat.players.push({ id: "u2", name: "Y", factionId: "f2", skill: 2 });
+dupSeat.seats.push({ id: "t9", roundId: "r1", tableNo: 0, seatNo: 1, playerId: "u2", rank: 1, score: 5 });
+rep = validateImport(dupSeat);
+assert(rep.errors.some((e) => e.code === "DUPLICATE_SEAT"), "同桌同座号重复被检出");
+
+const draftMissing = baseDoc();
+draftMissing.rounds[0] = { ...draftMissing.rounds[0], status: "draft" };
+draftMissing.seats[0] = { ...draftMissing.seats[0], rank: null, score: null };
+rep = validateImport(draftMissing);
+assert(rep.errors.length === 0, `草稿轮允许缺结果: ${JSON.stringify(rep.errors)}`);
 
 const cyc = baseDoc();
 cyc.rounds = [

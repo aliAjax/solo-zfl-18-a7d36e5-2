@@ -244,7 +244,68 @@ rows = await page.evaluate(() => [...document.querySelectorAll('[data-testid="st
 const leaderRow = rows.find((r) => r[1] === leader);
 check("处罚：3 − 2 = 1 并即时重算排名", leaderRow[7] === "1" && leaderRow[6] === "−2", JSON.stringify(leaderRow));
 
-// ============ 8. 更正旧赛果 → 审计 + 重算 ============
+// ============ 8a. 非法更正：负分 / 零名次 / 缺失 / 断档，全部阻断并回滚 ============
+await gotoTab("results");
+await page.selectOption('[data-testid="results-round"]', { index: 0 });
+await page.waitForTimeout(60);
+const auditCount = () => page.evaluate(() => window.LEAGUE.store.state.audit.length);
+const auditN0 = await auditCount();
+const targetSeats = await page.evaluate(() => {
+  const t = document.querySelector(".results-tables .game-table");
+  return [...t.querySelectorAll("tbody tr")].map((tr) => {
+    const score = tr.querySelector(".score-input");
+    return { id: score.dataset.seat, name: tr.children[0].textContent.trim() };
+  });
+});
+const correctViaUI = async (seatId, field, value) =>
+  page.evaluate(({ seatId, field, value }) => {
+    const input = document.querySelector(`.${field}-input[data-seat="${seatId}"]`);
+    input.focus();
+    input.value = value;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.blur(); // blur 原生触发 focusout
+    return document.querySelector("#toast").textContent;
+  }, { seatId, field, value });
+const seatInStore = (id) => page.evaluate((sid) => {
+  const s = window.LEAGUE.store.state.seats.find((x) => x.id === sid);
+  return { score: s.score, rank: s.rank };
+}, id);
+
+// 负比分（input 阶段即被拒，旧值保留）
+const s0Before = await seatInStore(targetSeats[0].id);
+let toastMsg = await correctViaUI(targetSeats[0].id, "score", "-5");
+check("非法更正：负比分被阻断", /拒绝|比分必须|恢复/.test(toastMsg), toastMsg);
+const s0After = await seatInStore(targetSeats[0].id);
+check("非法更正：负比分回滚为原值", s0After.score === s0Before.score, `${s0Before.score}→${s0After.score}`);
+
+// 零名次
+const s1Before = await seatInStore(targetSeats[1].id);
+toastMsg = await correctViaUI(targetSeats[1].id, "rank", "0");
+check("非法更正：零名次被阻断", /拒绝|名次|恢复/.test(toastMsg), toastMsg);
+const s1After = await seatInStore(targetSeats[1].id);
+check("非法更正：零名次回滚为原值", s1After.rank === s1Before.rank, `${s1Before.rank}→${s1After.rank}`);
+
+// 缺失结果：清空名次
+const s2Before = await seatInStore(targetSeats[2].id);
+toastMsg = await correctViaUI(targetSeats[2].id, "rank", "");
+check("非法更正：缺失名次被阻断", /拒绝|未填|恢复/.test(toastMsg), toastMsg);
+const s2After = await seatInStore(targetSeats[2].id);
+check("非法更正：缺失名次回滚为原值", s2After.rank === s2Before.rank, `${s2Before.rank}→${s2After.rank}`);
+
+// 名次断档：第 2 名改成 3（1,3,3）
+toastMsg = await correctViaUI(targetSeats[1].id, "rank", "3");
+check("非法更正：名次断档被阻断", /断档|拒绝|恢复/.test(toastMsg), toastMsg);
+check("非法更正：断档回滚为原值", (await seatInStore(targetSeats[1].id)).rank === s1Before.rank);
+
+// 没有任何更正审计产生
+check("非法更正：不写入审计", (await auditCount()) === auditN0, `${auditN0}→${await auditCount()}`);
+// 积分榜仍按原值正常显示
+await gotoTab("standings");
+rows = await page.evaluate(() => [...document.querySelectorAll('[data-testid="standings-table"] tbody tr')].map((tr) => [...tr.children].map((td) => td.textContent.trim())));
+check("非法更正：积分榜仍正常（9 行、首行有总分）", rows.length === 9 && rows[0][7] !== "", JSON.stringify(rows[0]));
+await shot(page, "07a-correction-blocked");
+
+// ============ 8. 更正旧赛果（合法）→ 审计 + 重算 ============
 await gotoTab("results");
 await page.selectOption('[data-testid="results-round"]', { index: 0 });
 await page.waitForTimeout(60);
@@ -257,13 +318,14 @@ const corrected = await page.evaluate(() => {
   return { who: second.children[0].textContent.trim(), audit: aud?.detail || null };
 });
 await page.waitForTimeout(100);
-check("更正旧赛果：写入审计", !!corrected.audit, "无更正审计");
-check("更正审计：详情含前后名次", /名次/.test(corrected.audit || ""), corrected.audit);
+check("合法更正：写入审计", !!corrected.audit, "无更正审计");
+check("合法更正：详情含前后名次", /名次/.test(corrected.audit || ""), corrected.audit);
+check("合法更正：审计条数增加", (await auditCount()) === auditN0 + 1, `${auditN0}→${await auditCount()}`);
 await gotoTab("standings");
-await shot(page, "07-recalculated");
+shot(page, "07-recalculated");
 rows = await page.evaluate(() => [...document.querySelectorAll('[data-testid="standings-table"] tbody tr')].map((tr) => [...tr.children].map((td) => td.textContent.trim())));
 const correctedRow = rows.find((r) => r[1] === corrected.who);
-check("更正后：该玩家拿到平局分 1（后续已重算）", correctedRow[5] === "1", JSON.stringify(correctedRow));
+check("合法更正：该玩家拿到平局分 1（后续已重算）", correctedRow[5] === "1", JSON.stringify(correctedRow));
 
 // ============ 9. 第 2 轮：不重复同桌自动分桌 ============
 await gotoTab("round");
@@ -357,30 +419,59 @@ await pageB.close();
 // ============ 11. 导入回滚 ============
 await gotoTab("io");
 const beforeCount = (await $state()).players.length;
-const badDoc = await page.evaluate(() => {
+const round1Id = (await $state()).rounds.find((r) => r.no === 1).id;
+const badDoc = await page.evaluate((rid) => {
   const s = window.LEAGUE.store.state;
   const doc = { schema: "league-console/v1", seasons: s.seasons, players: s.players.map((p) => ({ ...p })),
     factions: s.factions, rounds: s.rounds.map((r) => ({ ...r })), seats: s.seats.map((x) => ({ ...x })), penalties: s.penalties };
-  doc.seats.push({ ...doc.seats[0], id: "dup_seat", seatNo: 99 });       // 重复参赛者
+  const r1 = doc.seats.filter((x) => x.roundId === rid);
+  doc.seats.push({ ...doc.seats[0], id: "dup_entry", seatNo: 99 });        // 重复参赛者
   doc.players[0] = { ...doc.players[0], factionId: "fac_does_not_exist" }; // 悬空阵营引用
-  doc.seats[1] = { ...doc.seats[1], score: -42 };                         // 非法比分
+  doc.seats[1] = { ...doc.seats[1], score: -42 };                          // 非法比分
+  const seatedIds = new Set(r1.map((x) => x.playerId));
+  const outsider = doc.players.find((p) => !seatedIds.has(p.id));
+  doc.seats.push({ ...r1[0], id: "dup_pos", playerId: outsider.id, originalPlayerId: null, rank: 1, score: 5 }); // 同桌同座号重复
+  doc.seats[2] = { ...doc.seats[2], rank: null, score: null };             // 已结算轮缺失结果
   doc.rounds[0] = { ...doc.rounds[0], derivedFromRoundId: doc.rounds[1].id };
   doc.rounds[1] = { ...doc.rounds[1], derivedFromRoundId: doc.rounds[0].id }; // 循环引用
   return doc;
-});
+}, round1Id);
 const badPath = path.join(SHOTS, "bad-import.json");
 await writeFile(badPath, JSON.stringify(badDoc));
 await page.setInputFiles('[data-testid="import-file"]', badPath);
 await page.waitForTimeout(150);
 const report = await page.textContent('[data-testid="import-report"]');
-for (const code of ["DUPLICATE_ENTRY", "MISSING_FACTION", "BAD_SCORE", "CYCLE"]) {
-  check(`导入报告：检出 ${code}`, report.includes(code));
+for (const code of ["DUPLICATE_ENTRY", "DUPLICATE_SEAT", "MISSING_FACTION", "BAD_SCORE", "MISSING_RESULT", "CYCLE"]) {
+  check(`导入报告：检出 ${code}`, report.includes(code), report.slice(0, 300));
 }
 const applyHandle = await page.$('[data-testid="import-apply"]');
 check("失败导入：应用按钮禁用", !(await applyHandle.isEnabled()));
 check("失败导入：现有数据不被覆盖（玩家数不变）", (await $state()).players.length === beforeCount, `${beforeCount}→${(await $state()).players.length}`);
 check("失败导入：非法比分未入库", !(await $state()).seats.some((x) => x.score === -42));
+check("失败导入：重复座号未入库", (await $state()).seats.filter((x) => x.id === "dup_pos").length === 0);
+const round1Intact = await page.evaluate((rid) => {
+  const list = window.LEAGUE.store.state.seats.filter((x) => x.roundId === rid);
+  return list.length > 0 && list.every((x) => Number.isInteger(x.rank) && Number.isInteger(x.score));
+}, round1Id);
+check("失败导入：缺失结果未影响原赛果（第 1 轮结果仍完整）", round1Intact);
 await shot(page, "10-import-blocked");
+
+// 单独：名次断档导入（1,3,3）
+const gapDoc = await page.evaluate((rid) => {
+  const s = window.LEAGUE.store.state;
+  const doc = { schema: "league-console/v1", seasons: s.seasons, players: s.players, factions: s.factions,
+    rounds: s.rounds.map((r) => ({ ...r })), seats: s.seats.map((x) => ({ ...x })), penalties: s.penalties };
+  const list = doc.seats.filter((x) => x.roundId === rid).sort((a, b) => a.tableNo - b.tableNo || a.seatNo - b.seatNo);
+  list[0].rank = 1; list[1].rank = 3; list[2].rank = 3;
+  return doc;
+}, round1Id);
+const gapPath = path.join(SHOTS, "gap-import.json");
+await writeFile(gapPath, JSON.stringify(gapDoc));
+await page.setInputFiles('[data-testid="import-file"]', gapPath);
+await page.waitForTimeout(150);
+const gapReport = await page.textContent('[data-testid="import-report"]');
+check("导入报告：检出名次断档", gapReport.includes("断档") && gapReport.includes("BAD_SCORE"), gapReport.slice(0, 200));
+check("断档导入：现有数据不变", (await $state()).players.length === beforeCount);
 
 await page.setInputFiles('[data-testid="import-file"]', { name: "x.json", mimeType: "application/json", buffer: Buffer.from("{broken") });
 await page.waitForTimeout(100);

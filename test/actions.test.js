@@ -136,5 +136,39 @@ assert(standings.reduce((sum, r) => sum + r.resultPoints, 0) >= 14, `两轮 3 �
 assert(store.state.audit.length >= 10, `审计条目充分，实际 ${store.state.audit.length}`);
 assert(store.state.audit.every((a, i) => i === 0 || a.rev >= store.state.audit[i - 1].rev), "审计 rev 单调");
 
+// ---- 已结算更正：非法值必须阻断并回滚 ----
+const round1 = store.state.rounds.find((r) => r.no === 1);
+const t0seats = store.state.seats
+  .filter((s) => s.roundId === round1.id && s.tableNo === 0)
+  .sort((a, b) => a.seatNo - b.seatNo);
+const auditBefore = store.state.audit.length;
+const snap = JSON.stringify(t0seats.map((s) => ({ id: s.id, score: s.score, rank: s.rank })));
+
+// 负比分
+let r = A.correctSeatResult(t0seats[0].id, { score: -9 }, { score: t0seats[0].score, rank: t0seats[0].rank });
+expectFail(r, "更正为负比分被阻断");
+// 零名次
+r = A.correctSeatResult(t0seats[1].id, { rank: 0 }, { score: t0seats[1].score, rank: t0seats[1].rank });
+expectFail(r, "更正为零名次被阻断");
+// 缺失结果
+r = A.correctSeatResult(t0seats[2].id, { score: null }, { score: t0seats[2].score, rank: t0seats[2].rank });
+expectFail(r, "更正清空比分（缺失结果）被阻断");
+// 名次断档：把第二个人从 2 改成 3（1,3,3）
+r = A.correctSeatResult(t0seats[1].id, { rank: 3 }, { score: t0seats[1].score, rank: 2 });
+expectFail(r, "更正造成名次断档被阻断");
+// 全部回滚：座位值不变、未写审计
+const snapAfter = JSON.stringify(
+  store.state.seats.filter((s) => s.roundId === round1.id && s.tableNo === 0).sort((a, b) => a.seatNo - b.seatNo).map((s) => ({ id: s.id, score: s.score, rank: s.rank }))
+);
+assert(snap === snapAfter, "非法更正后原赛果完整保留（事务回滚）");
+assert(store.state.audit.length === auditBefore, "非法更正不写审计");
+
+// 合法更正：只改比分，名次不变 → 成功、写审计、积分榜仍可算
+r = A.correctSeatResult(t0seats[0].id, { score: t0seats[0].score + 7 }, { score: t0seats[0].score, rank: t0seats[0].rank });
+assert(r.ok, `合法更正应成功: ${JSON.stringify(r)}`);
+assert(store.state.audit.some((a) => a.action === "更正赛果"), "合法更正写入审计");
+const standingsAfter = computeStandings(store.state, sid);
+assert(standingsAfter.length === 9 && standingsAfter.every((x) => Number.isFinite(x.total)), "更正后积分榜正常重算");
+
 console.log(`\n${pass} 通过, ${fail} 失败`);
 process.exit(fail ? 1 : 0);

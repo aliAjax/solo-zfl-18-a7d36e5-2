@@ -6,7 +6,7 @@ import {
   seasonRounds,
   roundSeats,
   seatRound,
-  validateResults,
+  validateRoundResults,
   validateImport,
   findRoundCycle
 } from "./domain.js";
@@ -243,10 +243,8 @@ export function settleRound(roundId) {
     const round = d.rounds.find((r) => r.id === roundId);
     if (!round) throw new Error("轮次不存在");
     if (round.status !== ROUND_STATUS.PUBLISHED) throw new Error("只有已发布轮次可以结算（草稿必须先发布）");
-    const seats = d.seats.filter((s) => s.roundId === roundId && s.attendance !== "absent");
-    const tableCount = Math.max(...d.seats.filter((s) => s.roundId === roundId).map((s) => s.tableNo)) + 1;
-    const errors = validateResults(seats, tableCount);
-    if (errors.length) throw new Error(errors.map((e) => e.msg).join("；"));
+    const errors = validateRoundResults(d, roundId, { requireResults: true });
+    if (errors.length) throw new Error([...new Set(errors.map((e) => e.msg))].join("；"));
     round.status = ROUND_STATUS.SETTLED;
     round.settledAt = new Date().toISOString();
     return auditEntry("结算轮次", roundId, round.name);
@@ -255,13 +253,26 @@ export function settleRound(roundId) {
 
 // ---------- 赛果录入与更正 ----------
 export function patchSeatResult(seatId, patch) {
-  // 逐字录入：静默持久化（rev 仍推进，参与跨页合并），不刷 UI、不写审计
+  // 已发布轮逐字录入：静默持久化（rev 推进，参与跨页合并），不写审计，结算时统一强校验。
+  // 已结算轮：输入过程一律不落盘——更正只能在失焦时作为一个事务通过整轮校验后提交，
+  // 否则负分/空值/断档会在更正被拒后残留在状态里。
+  const seatNow = store.state.seats.find((s) => s.id === seatId);
+  const roundNow = seatNow && store.state.rounds.find((r) => r.id === seatNow.roundId);
+  if (!roundNow) return { ok: false, errors: ["座位不存在"] };
+  if (roundNow.status === ROUND_STATUS.SETTLED) return { ok: true, deferred: true };
+
   return store.commit(
     (d) => {
       const seat = d.seats.find((s) => s.id === seatId);
       if (!seat) throw new Error("座位不存在");
       const round = d.rounds.find((r) => r.id === seat.roundId);
       if (round.status === ROUND_STATUS.DRAFT) throw new Error("草稿轮次请先发布再录比分");
+      if ("score" in patch && patch.score !== null && (!Number.isInteger(patch.score) || patch.score < 0)) {
+        throw new Error("比分必须是非负整数");
+      }
+      if ("rank" in patch && patch.rank !== null && (!Number.isInteger(patch.rank) || patch.rank < 1)) {
+        throw new Error("名次必须是 ≥1 的整数");
+      }
       if ("score" in patch) seat.score = patch.score;
       if ("rank" in patch) seat.rank = patch.rank;
     },
@@ -270,7 +281,8 @@ export function patchSeatResult(seatId, patch) {
 }
 
 export function correctSeatResult(seatId, patch, before) {
-  // 已结算轮次失焦时：若值确有变化，记一条更正审计（后续积分由派生层自动重算）
+  // 已结算轮更正：候选值必须重新满足整轮赛果规则（缺失、负分、零名次、断档都阻断）。
+  // commit 抛错即整体回滚：旧赛果保留、不写审计、积分榜不变。
   return store.commit((d) => {
     const seat = d.seats.find((s) => s.id === seatId);
     if (!seat) throw new Error("座位不存在");
@@ -279,6 +291,12 @@ export function correctSeatResult(seatId, patch, before) {
     if ("score" in patch && before.score === patch.score && "rank" in patch && before.rank === patch.rank) return null;
     if ("score" in patch) seat.score = patch.score;
     if ("rank" in patch) seat.rank = patch.rank;
+
+    const errors = validateRoundResults(d, round.id, { requireResults: true });
+    if (errors.length) {
+      throw new Error([...new Set(errors.map((e) => e.msg))].join("；"));
+    }
+
     const changes = [];
     if (before.score !== seat.score) changes.push(`比分 ${before.score ?? "∅"}→${seat.score ?? "∅"}`);
     if (before.rank !== seat.rank) changes.push(`名次 ${before.rank ?? "∅"}→${seat.rank ?? "∅"}`);
