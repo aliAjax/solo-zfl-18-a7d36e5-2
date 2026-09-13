@@ -1,0 +1,16 @@
+{
+  "name": "workspace",
+  "version": "1.0.0",
+  "description": "一个纯前端本地应用，用来管理桌游收藏中的规则遗忘点、常见争议、开局准备和计分提醒。支持按最近未玩、人数范围和复杂度筛选，并在详情里展示聚会前快速复习卡片。",
+  "main": "._app.js",
+  "scripts": {
+    "test": "node test/domain.test.js && node test/store.test.js && node test/actions.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "playwright": "^1.63.0"
+  },
+  "type": "module"
+}
